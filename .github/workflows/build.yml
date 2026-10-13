@@ -1,0 +1,26 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: make
+      - name: Unit tests (AddressSanitizer and UBSan)
+        run: make test
+      # Marky targets macOS 27, which hosted runners don't offer yet, so the end-to-end checks
+      # run a second build made for the runner's macOS.
+      - name: Self-test (open, reload, zoom, export a PDF, close)
+        run: make selftest BUILD=build-smoke MIN_MACOS=26.0
+      - name: Package
+        run: ditto -c -k --keepParent build/Marky.app Marky.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Marky
+          path: Marky.zip

@@ -1,0 +1,15 @@
+module md4c {
+    header "md4c/md4c.h"
+    export *
+}
+
+module iosMath {
+    header "iosMath/lib/MTMathList.h"
+    header "iosMath/lib/MTMathListBuilder.h"
+    header "iosMath/lib/MTMathAtomFactory.h"
+    header "iosMath/render/MTFont.h"
+    header "iosMath/render/MTFontManager.h"
+    header "iosMath/render/MTMathListDisplay.h"
+    header "iosMath/render/internal/MTTypesetter.h"
+    export *
+}

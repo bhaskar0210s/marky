@@ -1,0 +1,1494 @@
+//
+//  MathAtomFactory.m
+//  iosMath
+//
+//  Created by Kostub Deshmukh on 8/28/13.
+//  Copyright (C) 2013 MathChat
+//   
+//  This software may be modified and distributed under the terms of the
+//  MIT license. See the LICENSE file for details.
+//
+
+#import "MTMathAtomFactory.h"
+#import "MTMathListBuilder.h"
+
+NSString *const MTSymbolMultiplication = @"\u00D7";
+NSString *const MTSymbolDivision = @"\u00F7";
+NSString *const MTSymbolFractionSlash = @"\u2044";
+NSString *const MTSymbolWhiteSquare = @"\u25A1";
+NSString *const MTSymbolBlackSquare = @"\u25A0";
+NSString *const MTSymbolLessEqual = @"\u2264";
+NSString *const MTSymbolGreaterEqual = @"\u2265";
+NSString *const MTSymbolNotEqual = @"\u2260";
+NSString *const MTSymbolSquareRoot = @"\u221A"; // \sqrt
+NSString *const MTSymbolCubeRoot = @"\u221B";
+NSString *const MTSymbolInfinity = @"\u221E"; // \infty
+NSString *const MTSymbolAngle = @"\u2220"; // \angle
+NSString *const MTSymbolDegree = @"\u00B0"; // \circ
+
+@implementation MTMacroDefinition
+- (instancetype)initWithArgumentCount:(NSUInteger)argumentCount
+                       templateString:(NSString*)templateString
+{
+    self = [super init];
+    if (self) {
+        _argumentCount = argumentCount;
+        _templateString = [templateString copy];
+    }
+    return self;
+}
+@end
+
+// Inter-column spacing for \begin{smallmatrix}, in mu. amsmath separates smallmatrix
+// columns with \thickspace = 5mu, measured under \scriptstyle (amsmath.dtx); KaTeX
+// mirrors this as 0.2778em = 5/18em (src/environments/array.ts). We store the honest
+// 5mu here and let the renderer scale the gap to the Script cell style
+// (MTTypesetter -cellStyleForTable:, PR 1), so the rendered gap is 5 * scriptScaleDown
+// outer-mu -- font-exact, with no pre-scaled magic factor baked into the model.
+static const CGFloat kSmallMatrixInterColumnSpacing = 5;
+
+@implementation MTMathStackCommandSpec
+- (instancetype)initWithOver:(nullable MTMathStackConstruction*)over
+                       under:(nullable MTMathStackConstruction*)under
+                displayClass:(MTMathAtomType)displayClass
+                    argRoles:(NSArray<NSNumber*>*)argRoles
+               inheritsClass:(BOOL)inheritsClass {
+    self = [super init];
+    if (self) {
+        _overConstruction = over;
+        _underConstruction = under;
+        _displayClass = displayClass;
+        _argRoles = [argRoles copy];
+        _inheritsClass = inheritsClass;
+    }
+    return self;
+}
+@end
+
+@implementation MTMathAtomFactory
+
++ (MTMathAtom *)times
+{
+    return [MTMathAtom atomWithType:kMTMathAtomBinaryOperator value:MTSymbolMultiplication];
+}
+
++ (MTMathAtom *)divide
+{
+    return [MTMathAtom atomWithType:kMTMathAtomBinaryOperator value:MTSymbolDivision];
+}
+
++ (MTMathAtom *)placeholder
+{
+    return [MTMathAtom atomWithType:kMTMathAtomPlaceholder value:MTSymbolWhiteSquare];
+}
+
++ (MTFraction *)placeholderFraction
+{
+    MTFraction *frac = [MTFraction new];
+    frac.numerator = [MTMathList new];
+    [frac.numerator addAtom:[self placeholder]];
+    frac.denominator = [MTMathList new];
+    [frac.denominator addAtom:[self placeholder]];
+    return frac;
+}
+
++ (MTRadical*) placeholderRadical
+{
+    MTRadical* rad = [MTRadical new];
+    rad.degree = [MTMathList new];
+    rad.radicand = [MTMathList new];
+    [rad.degree addAtom:self.placeholder];
+    [rad.radicand addAtom:self.placeholder];
+    return rad;
+}
+
++ (MTMathAtom *)placeholderSquareRoot
+{
+    MTRadical *rad = [MTRadical new];
+    rad.radicand = [MTMathList new];
+    [rad.radicand addAtom:[self placeholder]];
+    return rad;
+}
+
++ (MTLargeOperator *)operatorWithName:(NSString *)name limits:(bool) limits
+{
+    return [[MTLargeOperator alloc] initWithValue:name limits:limits];
+}
+
++ (nullable MTMathAtom *)atomForCharacter:(unichar)ch
+{
+    NSString *chStr = [NSString stringWithCharacters:&ch length:1];
+    if (ch < 0x21 || ch > 0x7E) {
+        // No atom for control characters, spaces, or non-ASCII literals. The
+        // builder decides what to do with these: whitespace is silently ignored,
+        // everything else raises MTParseErrorInvalidCharacter. Non-Latin text
+        // must be wrapped in \text*, \textbf{...}, etc.
+        return nil;
+    } else if (ch == '$' || ch == '%' || ch == '#' || ch == '&' || ch == '~' || ch == '\'') {
+        // LaTeX control characters with special meanings. They have no atom of
+        // their own; the builder handles them (& / ~ / ' are consumed before
+        // reaching here, while $ % # raise MTParseErrorInvalidCharacter).
+        return nil;
+    } else if (ch == '^' || ch == '_' || ch == '{' || ch == '}' || ch == '\\') {
+        // more special characters for Latex.
+        return nil;
+    } else if (ch == '(' || ch == '[') {
+        return [MTMathAtom atomWithType:kMTMathAtomOpen value:chStr];
+    } else if (ch == ')' || ch == ']' || ch == '!' || ch == '?') {
+        return [MTMathAtom atomWithType:kMTMathAtomClose value:chStr];
+    } else if (ch == ',' || ch == ';') {
+        return [MTMathAtom atomWithType:kMTMathAtomPunctuation value:chStr];
+    } else if (ch == '=' || ch == '>' || ch == '<') {
+        return [MTMathAtom atomWithType:kMTMathAtomRelation value:chStr];
+    } else if (ch == ':') {
+        // Math colon is ratio. Regular colon is \colon
+        return [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2236"];
+    } else if (ch == '-') {
+        // Use the math minus sign
+        return [MTMathAtom atomWithType:kMTMathAtomBinaryOperator value:@"\u2212"];
+    } else if (ch == '+' || ch == '*') {
+        return [MTMathAtom atomWithType:kMTMathAtomBinaryOperator value:chStr];
+    } else if (ch == '.' || (ch >= '0' && ch <= '9')) {
+        return [MTMathAtom atomWithType:kMTMathAtomNumber value:chStr];
+    } else if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')) {
+        return [MTMathAtom atomWithType:kMTMathAtomVariable value:chStr];
+    } else if (ch == '"' || ch == '/' || ch == '@' || ch == '`' || ch == '|') {
+        // just an ordinary character. The following are allowed ordinary chars
+        // | / ` @ "
+        return [MTMathAtom atomWithType:kMTMathAtomOrdinary value:chStr];
+    } else {
+        NSAssert(false, @"Unknown ascii character %@. Should have been accounted for.", @(ch));
+        return nil;
+    }
+}
+
++ (MTMathList *)mathListForCharacters:(NSString *)chars
+{
+    NSParameterAssert(chars);
+    NSInteger len = chars.length;
+    unichar *buff = malloc(sizeof(unichar) * (size_t)len);
+    NSAssert(len == 0 || buff != NULL, @"Failed to allocate buff");
+    [chars getCharacters:buff range:NSMakeRange(0, len)];
+    MTMathList* list = [[MTMathList alloc] init];
+    for (NSInteger i = 0; i < len; i++) {
+        MTMathAtom* atom = [self atomForCharacter:buff[i]];
+        if (atom) {
+            [list addAtom:atom];
+        }
+    }
+    free(buff);
+    return list;
+}
+
++ (nullable MTMathAtom *)atomForLatexSymbolName:(NSString *)symbolName
+{
+    NSParameterAssert(symbolName);
+    NSDictionary* aliases = [MTMathAtomFactory aliases];
+    // First check if this is an alias
+    NSString* canonicalName = aliases[symbolName];
+    if (canonicalName) {
+        // Switch to the canonical name
+        symbolName = canonicalName;
+    }
+
+    NSDictionary* commands = [self supportedLatexSymbols];
+    MTMathAtom* atom = commands[symbolName];
+    if (atom) {
+        // Return a copy of the atom since atoms are mutable.
+        return [atom copy];
+    }
+    return nil;
+}
+
++ (nullable NSString*) latexSymbolNameForAtom:(MTMathAtom*) atom
+{
+    if (atom.nucleus.length == 0) {
+        return nil;
+    }
+    NSDictionary<NSString*, NSDictionary<NSNumber*, NSString*>*>* dict = [MTMathAtomFactory textToLatexSymbolNames];
+    NSDictionary<NSNumber*, NSString*>* inner = dict[atom.nucleus];
+    if (!inner) {
+        return nil;
+    }
+    NSString* name = inner[@(atom.type)];
+    if (name) {
+        return name;
+    }
+    // -[MTMathList finalized] reclassifies leading/orphan/trailing Bin atoms to Un. The
+    // forward table only ever registers atoms as Bin, so a (nucleus, Un)
+    // lookup must fall back to the Bin cell to recover the canonical name.
+    if (atom.type == kMTMathAtomUnaryOperator) {
+        return inner[@(kMTMathAtomBinaryOperator)];
+    }
+    return nil;
+}
+
++ (void)addLatexSymbol:(NSString *)name value:(MTMathAtom *)atom
+{
+    NSParameterAssert(name);
+    NSParameterAssert(atom);
+    // Custom symbols are expected to be registered at setup time, before any
+    // concurrent parsing/rendering begins. The symbol tables are therefore not
+    // guarded at run time: once initialized (via dispatch_once in each accessor)
+    // they are only read, and concurrent reads of an unmutated dictionary are
+    // safe. Do not call this while parsing on another thread.
+    NSMutableDictionary<NSString*, MTMathAtom*>* commands = [self supportedLatexSymbols];
+    commands[name] = [atom copy];   // copy on write — symmetric with the read side, which
+                                    // copies because atoms are mutable
+    if (atom.nucleus.length != 0) {
+        NSMutableDictionary<NSString*, NSMutableDictionary<NSNumber*, NSString*>*>* dict = [self textToLatexSymbolNames];
+        NSMutableDictionary<NSNumber*, NSString*>* inner = dict[atom.nucleus];
+        if (!inner) {
+            inner = [NSMutableDictionary dictionaryWithCapacity:1];
+            dict[atom.nucleus] = inner;
+        }
+        NSNumber* typeKey = @(atom.type);
+        NSString* existing = inner[typeKey];
+        if (!existing || name.length < existing.length ||
+            (name.length == existing.length && [name compare:existing] != NSOrderedDescending)) {
+            inner[typeKey] = name;
+        }
+    }
+}
+
++ (NSArray<NSString *> *)supportedLatexSymbolNames
+{
+    NSDictionary<NSString*, MTMathAtom*>* commands = [MTMathAtomFactory supportedLatexSymbols];
+    return commands.allKeys;
+}
+
++ (nullable MTAccent*) accentWithName:(NSString*) accentName
+{
+    NSDictionary<NSString*, NSString*> *accents = [MTMathAtomFactory accents];
+    NSString* accentValue = accents[accentName];
+    if (accentValue) {
+        return [[MTAccent alloc] initWithValue:accentValue];
+    } else {
+        return nil;
+    }
+}
+
++(NSString*) accentName:(MTAccent*) accent
+{
+    NSDictionary* dict = [MTMathAtomFactory accentValueToName];
+    return dict[accent.nucleus];
+}
+
++ (nullable MTMathAtom *)boundaryAtomForDelimiterName:(NSString *)delimName
+{
+    NSDictionary<NSString*, NSString*>* delims = [MTMathAtomFactory delimiters];
+    NSString* delimValue = delims[delimName];
+    if (!delimValue) {
+        return nil;
+    }
+    return [MTMathAtom atomWithType:kMTMathAtomBoundary value:delimValue];
+}
+
++ (NSString*) delimiterNameForBoundaryAtom:(MTMathAtom*) boundary
+{
+    if (boundary.type != kMTMathAtomBoundary) {
+        return nil;
+    }
+    NSDictionary* dict = [self delimValueToName];
+    return dict[boundary.nucleus];
+}
+
++ (MTFontStyle)fontStyleWithName:(NSString *)fontName {
+    NSDictionary<NSString*, NSNumber*>* fontStyles = [self fontStyles];
+    NSNumber* style = fontStyles[fontName];
+    if (style == nil) {
+        return NSNotFound;
+    }
+    return style.integerValue;
+}
+
++ (NSDictionary<NSString*, NSNumber*>*) textStyles
+{
+    static NSDictionary<NSString*, NSNumber*>* textStyles = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        textStyles = @{
+            @"text":   @(kMTTextStyleRoman),
+            @"textrm": @(kMTTextStyleRoman),
+            @"textbf": @(kMTTextStyleBold),
+            @"textit": @(kMTTextStyleItalic),
+            @"textsf": @(kMTTextStyleSansSerif),
+            @"texttt": @(kMTTextStyleTypewriter),
+        };
+    });
+    return textStyles;
+}
+
++ (MTTextStyle) textStyleWithName:(NSString *)name
+{
+    NSNumber* boxed = [self textStyles][name];
+    if (!boxed) {
+        return (MTTextStyle)NSNotFound;
+    }
+    return (MTTextStyle)boxed.unsignedIntegerValue;
+}
+
++ (NSString*) commandNameForTextStyle:(MTTextStyle)style
+{
+    switch (style) {
+        case kMTTextStyleRoman:      return @"text";
+        case kMTTextStyleBold:       return @"textbf";
+        case kMTTextStyleItalic:     return @"textit";
+        case kMTTextStyleSansSerif:  return @"textsf";
+        case kMTTextStyleTypewriter: return @"texttt";
+    }
+    NSAssert(NO, @"Unknown MTTextStyle %lu", (unsigned long)style);
+    return @"text";
+}
+
++ (NSString *)fontNameForStyle:(MTFontStyle)fontStyle
+{
+    switch (fontStyle) {
+        case kMTFontStyleDefault:
+            return @"mathnormal";
+
+        case kMTFontStyleRoman:
+            return @"mathrm";
+
+        case kMTFontStyleBold:
+            return @"mathbf";
+
+        case kMTFontStyleFraktur:
+            return @"mathfrak";
+
+        case kMTFontStyleCaligraphic:
+            return @"mathcal";
+
+        case kMTFontStyleItalic:
+            return @"mathit";
+
+        case kMTFontStyleSansSerif:
+            return @"mathsf";
+
+        case kMTFontStyleBlackboard:
+            return @"mathbb";
+
+        case kMTFontStyleTypewriter:
+            return @"mathtt";
+
+        case kMTFontStyleBoldItalic:
+            return @"bm";
+    }
+}
+
++ (MTFraction *)fractionWithNumerator:(MTMathList *)num denominator:(MTMathList *)denom
+{
+    MTFraction *frac = [[MTFraction alloc] init];
+    frac.numerator = num;
+    frac.denominator = denom;
+    return frac;
+}
+
++ (MTFraction *)fractionWithNumeratorStr:(NSString *)numStr denominatorStr:(NSString *)denomStr
+{
+    MTMathList* num = [self mathListForCharacters:numStr];
+    MTMathList* denom = [self mathListForCharacters:denomStr];
+    return [self fractionWithNumerator:num denominator:denom];
+}
+
++ (nullable MTMathAtom *)tableWithEnvironment:(NSString *)env rows:(NSArray<NSArray<MTMathList *> *> *)rows error:(NSError * _Nullable __autoreleasing *)error
+{
+    MTMathTable* table = [[MTMathTable alloc] initWithEnvironment:env];
+    for (NSUInteger i = 0; i < rows.count; i++) {
+        NSArray<MTMathList*>* row = rows[i];
+        for (NSUInteger j = 0; j < row.count; j++) {
+            [table setCell:row[j] forRow:i column:j];
+        }
+    }
+    static NSDictionary<NSString*, NSArray*>* matrixEnvs = nil;
+    static dispatch_once_t matrixEnvsOnce;
+    dispatch_once(&matrixEnvsOnce, ^{
+        matrixEnvs = @{ @"matrix" : @[],
+                        @"pmatrix" : @[ @"(", @")"],
+                        @"bmatrix" : @[ @"[", @"]"],
+                        @"Bmatrix" : @[ @"{", @"}"],
+                        @"vmatrix" : @[ @"vert", @"vert"],
+                        @"Vmatrix" : @[ @"Vert", @"Vert"], };
+    });
+    if ([matrixEnvs objectForKey:env]) {
+        // it is set to matrix as the delimiters are converted to latex outside the table.
+        table.environment = @"matrix";
+        table.interRowAdditionalSpacing = 0;
+        table.interColumnSpacing = 18;
+        // All the cells render in textstyle.
+        table.cellStyle = kMTLineStyleText;
+        // Add delimiters
+        NSArray* delims = [matrixEnvs objectForKey:env];
+        if (delims.count == 2) {
+            MTInner* inner = [[MTInner alloc] init];
+            inner.leftBoundary = [self boundaryAtomForDelimiterName:delims[0]];
+            inner.rightBoundary = [self boundaryAtomForDelimiterName:delims[1]];
+            inner.innerList = [MTMathList mathListWithAtoms:table, nil];
+            return inner;
+        } else {
+            return table;
+        }
+    } else if (!env) {
+        // The default env.
+        table.interRowAdditionalSpacing = 1;
+        table.interColumnSpacing = 0;
+        NSInteger cols = table.numColumns;
+        for (int i = 0; i < cols; i++) {
+            [table setAlignment:kMTColumnAlignmentLeft forColumn:i];
+        }
+        return table;
+    } else if ([env isEqualToString:@"aligned"] && table.numColumns != 2) {
+        // Several right/left pairs per row, as amsmath's align allows, with a 2em gap
+        // (\qquad) at the start of every pair after the first.
+        NSInteger cols = table.numColumns;
+        for (NSUInteger i = 0; i < table.cells.count; i++) {
+            NSArray<MTMathList*>* row = table.cells[i];
+            for (NSUInteger j = 1; j < row.count; j++) {
+                if (j % 2 == 1) {
+                    [row[j] insertAtom:[MTMathAtom atomWithType:kMTMathAtomOrdinary value:@""] atIndex:0];
+                } else {
+                    MTMathAtom* gap = [self atomForLatexSymbolName:@"qquad"];
+                    if (gap) {
+                        [row[j] insertAtom:gap atIndex:0];
+                    }
+                }
+            }
+        }
+        table.interRowAdditionalSpacing = 1;
+        table.interColumnSpacing = 0;
+        for (int j = 0; j < cols; j++) {
+            [table setAlignment:(j % 2 == 0 ? kMTColumnAlignmentRight : kMTColumnAlignmentLeft) forColumn:j];
+        }
+        return table;
+    } else if ([env isEqualToString:@"eqalign"] || [env isEqualToString:@"split"] || [env isEqualToString:@"aligned"]) {
+        if (table.numColumns != 2) {
+            NSString* message = [NSString stringWithFormat:@"%@ environment can only have 2 columns", env];
+            if (error != nil) {
+                *error = [NSError errorWithDomain:MTParseError code:MTParseErrorInvalidNumColumns userInfo:@{ NSLocalizedDescriptionKey : message }];
+            }
+            return nil;
+        }
+        // Add a spacer before each of the second column elements. This is to create the correct spacing for = and other releations.
+        MTMathAtom* spacer = [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@""];
+        for (NSUInteger i = 0; i < table.cells.count; i++) {
+            NSArray<MTMathList*>* row = table.cells[i];
+            if (row.count > 1) {
+                [row[1] insertAtom:spacer atIndex:0];
+            }
+        }
+        table.interRowAdditionalSpacing = 1;
+        table.interColumnSpacing = 0;
+        [table setAlignment:kMTColumnAlignmentRight forColumn:0];
+        [table setAlignment:kMTColumnAlignmentLeft forColumn:1];
+        return table;
+    } else if ([env isEqualToString:@"displaylines"] || [env isEqualToString:@"gather"] || [env isEqualToString:@"gathered"]) {
+        if (table.numColumns != 1) {
+            NSString* message = [NSString stringWithFormat:@"%@ environment can only have 1 column", env];
+            if (error != nil) {
+                *error = [NSError errorWithDomain:MTParseError code:MTParseErrorInvalidNumColumns userInfo:@{ NSLocalizedDescriptionKey : message }];
+            }
+            return nil;
+        }
+        table.interRowAdditionalSpacing = 1;
+        table.interColumnSpacing = 0;
+        [table setAlignment:kMTColumnAlignmentCenter forColumn:0];
+        return table;
+    } else if ([env isEqualToString:@"eqnarray"]) {
+        if (table.numColumns != 3) {
+            NSString* message = @"eqnarray environment can only have 3 columns";
+            if (error != nil) {
+                *error = [NSError errorWithDomain:MTParseError code:MTParseErrorInvalidNumColumns userInfo:@{ NSLocalizedDescriptionKey : message }];
+            }
+            return nil;
+        }
+        table.interRowAdditionalSpacing = 1;
+        table.interColumnSpacing = 18;
+        [table setAlignment:kMTColumnAlignmentRight forColumn:0];
+        [table setAlignment:kMTColumnAlignmentCenter forColumn:1];
+        [table setAlignment:kMTColumnAlignmentLeft forColumn:2];
+        return table;
+    } else if ([env isEqualToString:@"cases"]) {
+        if (table.numColumns != 2) {
+            NSString* message = @"cases environment can only have 2 columns";
+            if (error != nil) {
+                *error = [NSError errorWithDomain:MTParseError code:MTParseErrorInvalidNumColumns userInfo:@{ NSLocalizedDescriptionKey : message }];
+            }
+            return nil;
+        }
+        table.interRowAdditionalSpacing = 0;
+        table.interColumnSpacing = 18;
+        [table setAlignment:kMTColumnAlignmentLeft forColumn:0];
+        [table setAlignment:kMTColumnAlignmentLeft forColumn:1];
+        // All the cells render in textstyle.
+        table.cellStyle = kMTLineStyleText;
+        // Add delimiters
+        MTInner* inner = [[MTInner alloc] init];
+        inner.leftBoundary = [self boundaryAtomForDelimiterName:@"{"];
+        inner.rightBoundary = [self boundaryAtomForDelimiterName:@"."];
+        MTMathAtom* space = [self atomForLatexSymbolName:@","];
+        inner.innerList = [MTMathList mathListWithAtoms:space, table, nil];
+        return inner;
+    } else if ([env isEqualToString:@"smallmatrix"]) {
+        // Compact inline matrix: script-style cells, no delimiters, center default.
+        table.interRowAdditionalSpacing = 0;
+        table.interColumnSpacing = kSmallMatrixInterColumnSpacing;
+        table.cellStyle = kMTLineStyleScript;
+        return table;
+    } else if ([env isEqualToString:@"alignedat"]) {
+        // Generalization of the aligned branch to n alignment pairs (2n columns).
+        // The parser has already validated numColumns == 2n.
+        NSInteger cols = table.numColumns;
+        // Relation spacer before each odd column (mirrors aligned's column-1 spacer,
+        // repeated per pair) for correct = / relation spacing.
+        MTMathAtom* spacer = [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@""];
+        for (NSUInteger i = 0; i < table.cells.count; i++) {
+            NSArray<MTMathList*>* row = table.cells[i];
+            for (NSUInteger j = 0; j < row.count; j++) {
+                if (j % 2 == 1) {
+                    [row[j] insertAtom:spacer atIndex:0];
+                }
+            }
+        }
+        table.interRowAdditionalSpacing = 1;
+        table.interColumnSpacing = 0;
+        for (int j = 0; j < cols; j++) {
+            [table setAlignment:(j % 2 == 0 ? kMTColumnAlignmentRight : kMTColumnAlignmentLeft) forColumn:j];
+        }
+        return table;
+    }
+    if (error) {
+        NSString* message = [NSString stringWithFormat:@"Unknown environment: %@", env];
+        *error = [NSError errorWithDomain:MTParseError code:MTParseErrorInvalidEnv userInfo:@{ NSLocalizedDescriptionKey : message }];
+    }
+    return nil;
+}
+
++ (nullable MTMathAtom*) arrayTableWithAlignments:(NSArray<NSNumber*>*) columnAlignments
+                                    verticalLines:(NSArray<NSNumber*>*) verticalLines
+                                  horizontalLines:(NSArray<NSNumber*>*) horizontalLines
+                                             rows:(NSArray<NSArray<MTMathList*>*>*) rows
+                                            error:(NSError**) error
+{
+    MTMathTable* table = [[MTMathTable alloc] initWithEnvironment:@"array"];
+    NSInteger numCols = columnAlignments.count;
+    for (NSUInteger i = 0; i < rows.count; i++) {
+        NSArray<MTMathList*>* row = rows[i];
+        if ((NSInteger) row.count > numCols) {
+            if (error) {
+                NSString* message = [NSString stringWithFormat:
+                    @"array row has %ld cells but column specification declares %ld columns",
+                    (long) row.count, (long) numCols];
+                *error = [NSError errorWithDomain:MTParseError
+                                             code:MTParseErrorInvalidNumColumns
+                                         userInfo:@{ NSLocalizedDescriptionKey : message }];
+            }
+            return nil;
+        }
+        for (NSUInteger j = 0; j < row.count; j++) {
+            [table setCell:row[j] forRow:i column:j];
+        }
+        // Pad short rows out to numCols. numColumns is derived from the widest row,
+        // so without this a trailing all-empty column (its alignment + vertical rule)
+        // would be silently dropped. setCell backfills the intermediate cells.
+        if ((NSInteger) row.count < numCols) {
+            [table setCell:[MTMathList new] forRow:i column:numCols - 1];
+        }
+    }
+    for (int j = 0; j < numCols; j++) {
+        [table setAlignment:columnAlignments[j].integerValue forColumn:j];
+    }
+    // Normalize verticalLines to length numCols+1 so every declared column boundary is
+    // represented (mirrors horizontalLines below). Guard nil for the nonnull property.
+    NSMutableArray<NSNumber*>* vLines = [NSMutableArray arrayWithArray:verticalLines ?: @[]];
+    while ((NSInteger) vLines.count < numCols + 1) {
+        [vLines addObject:@0];
+    }
+    table.verticalLines = vLines;
+    // Normalize horizontalLines to length numRows+1 so the renderer can index boundaries.
+    NSMutableArray<NSNumber*>* hLines = [NSMutableArray arrayWithArray:horizontalLines ?: @[]];
+    while (hLines.count < table.numRows + 1) {
+        [hLines addObject:@0];
+    }
+    table.horizontalLines = hLines;
+    table.interRowAdditionalSpacing = 0;
+    table.interColumnSpacing = 18;   // ≈ 2·\arraycolsep at the default size; matches matrix.
+    table.cellStyle = kMTLineStyleText;   // post-#245: cells render textstyle via the table.
+    return table;
+}
+
++ (NSMutableDictionary<NSString*, MTMathAtom*>*) supportedLatexSymbols
+{
+    static NSMutableDictionary<NSString*, MTMathAtom*>* commands = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        commands = [NSMutableDictionary dictionaryWithDictionary:@{
+                     // Greek characters
+                     @"alpha" : [MTMathAtom atomWithType:kMTMathAtomVariable value:@"\u03B1"],
+                     @"beta" : [MTMathAtom atomWithType:kMTMathAtomVariable value:@"\u03B2"],
+                     @"gamma" : [MTMathAtom atomWithType:kMTMathAtomVariable value:@"\u03B3"],
+                     @"delta" : [MTMathAtom atomWithType:kMTMathAtomVariable value:@"\u03B4"],
+                     @"varepsilon" : [MTMathAtom atomWithType:kMTMathAtomVariable value:@"\u03B5"],
+                     @"zeta" : [MTMathAtom atomWithType:kMTMathAtomVariable value:@"\u03B6"],
+                     @"eta" : [MTMathAtom atomWithType:kMTMathAtomVariable value:@"\u03B7"],
+                     @"theta" : [MTMathAtom atomWithType:kMTMathAtomVariable value:@"\u03B8"],
+                     @"iota" : [MTMathAtom atomWithType:kMTMathAtomVariable value:@"\u03B9"],
+                     @"kappa" : [MTMathAtom atomWithType:kMTMathAtomVariable value:@"\u03BA"],
+                     @"lambda" : [MTMathAtom atomWithType:kMTMathAtomVariable value:@"\u03BB"],
+                     @"mu" : [MTMathAtom atomWithType:kMTMathAtomVariable value:@"\u03BC"],
+                     @"nu" : [MTMathAtom atomWithType:kMTMathAtomVariable value:@"\u03BD"],
+                     @"xi" : [MTMathAtom atomWithType:kMTMathAtomVariable value:@"\u03BE"],
+                     @"omicron" : [MTMathAtom atomWithType:kMTMathAtomVariable value:@"\u03BF"],
+                     @"pi" : [MTMathAtom atomWithType:kMTMathAtomVariable value:@"\u03C0"],
+                     @"rho" : [MTMathAtom atomWithType:kMTMathAtomVariable value:@"\u03C1"],
+                     @"varsigma" : [MTMathAtom atomWithType:kMTMathAtomVariable value:@"\u03C2"],
+                     @"sigma" : [MTMathAtom atomWithType:kMTMathAtomVariable value:@"\u03C3"],
+                     @"tau" : [MTMathAtom atomWithType:kMTMathAtomVariable value:@"\u03C4"],
+                     @"upsilon" : [MTMathAtom atomWithType:kMTMathAtomVariable value:@"\u03C5"],
+                     @"varphi" : [MTMathAtom atomWithType:kMTMathAtomVariable value:@"\u03C6"],
+                     @"chi" : [MTMathAtom atomWithType:kMTMathAtomVariable value:@"\u03C7"],
+                     @"psi" : [MTMathAtom atomWithType:kMTMathAtomVariable value:@"\u03C8"],
+                     @"omega" : [MTMathAtom atomWithType:kMTMathAtomVariable value:@"\u03C9"],
+
+                     @"vartheta" : [MTMathAtom atomWithType:kMTMathAtomVariable value:@"\u03D1"],
+                     @"phi" : [MTMathAtom atomWithType:kMTMathAtomVariable value:@"\u03D5"],
+                     @"varpi" : [MTMathAtom atomWithType:kMTMathAtomVariable value:@"\u03D6"],
+                     @"varkappa" : [MTMathAtom atomWithType:kMTMathAtomVariable value:@"\u03F0"],
+                     @"varrho" : [MTMathAtom atomWithType:kMTMathAtomVariable value:@"\u03F1"],
+                     @"epsilon" : [MTMathAtom atomWithType:kMTMathAtomVariable value:@"\u03F5"],
+
+                     // Capital greek characters
+                     @"Gamma" : [MTMathAtom atomWithType:kMTMathAtomVariable value:@"\u0393"],
+                     @"Delta" : [MTMathAtom atomWithType:kMTMathAtomVariable value:@"\u0394"],
+                     @"Theta" : [MTMathAtom atomWithType:kMTMathAtomVariable value:@"\u0398"],
+                     @"Lambda" : [MTMathAtom atomWithType:kMTMathAtomVariable value:@"\u039B"],
+                     @"Xi" : [MTMathAtom atomWithType:kMTMathAtomVariable value:@"\u039E"],
+                     @"Pi" : [MTMathAtom atomWithType:kMTMathAtomVariable value:@"\u03A0"],
+                     @"Sigma" : [MTMathAtom atomWithType:kMTMathAtomVariable value:@"\u03A3"],
+                     @"Upsilon" : [MTMathAtom atomWithType:kMTMathAtomVariable value:@"\u03A5"],
+                     @"Phi" : [MTMathAtom atomWithType:kMTMathAtomVariable value:@"\u03A6"],
+                     @"Psi" : [MTMathAtom atomWithType:kMTMathAtomVariable value:@"\u03A8"],
+                     @"Omega" : [MTMathAtom atomWithType:kMTMathAtomVariable value:@"\u03A9"],
+                     
+                     // Open
+                     @"lceil" : [MTMathAtom atomWithType:kMTMathAtomOpen value:@"\u2308"],
+                     @"lfloor" : [MTMathAtom atomWithType:kMTMathAtomOpen value:@"\u230A"],
+                     @"langle" : [MTMathAtom atomWithType:kMTMathAtomOpen value:@"\u27E8"],
+                     @"lgroup" : [MTMathAtom atomWithType:kMTMathAtomOpen value:@"\u27EE"],
+                     
+                     // Close
+                     @"rceil" : [MTMathAtom atomWithType:kMTMathAtomClose value:@"\u2309"],
+                     @"rfloor" : [MTMathAtom atomWithType:kMTMathAtomClose value:@"\u230B"],
+                     @"rangle" : [MTMathAtom atomWithType:kMTMathAtomClose value:@"\u27E9"],
+                     @"rgroup" : [MTMathAtom atomWithType:kMTMathAtomClose value:@"\u27EF"],
+                     
+                     // Arrows
+                     @"leftarrow" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2190"],
+                     @"uparrow" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2191"],
+                     @"rightarrow" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2192"],
+                     @"downarrow" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2193"],
+                     @"leftrightarrow" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2194"],
+                     @"updownarrow" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2195"],
+                     @"nwarrow" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2196"],
+                     @"nearrow" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2197"],
+                     @"searrow" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2198"],
+                     @"swarrow" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2199"],
+                     @"mapsto" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u21A6"],
+                     @"Leftarrow" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u21D0"],
+                     @"Uparrow" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u21D1"],
+                     @"Rightarrow" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u21D2"],
+                     @"Downarrow" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u21D3"],
+                     @"Leftrightarrow" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u21D4"],
+                     @"Updownarrow" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u21D5"],
+                     @"longleftarrow" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u27F5"],
+                     @"longrightarrow" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u27F6"],
+                     @"longleftrightarrow" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u27F7"],
+                     @"Longleftarrow" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u27F8"],
+                     @"Longrightarrow" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u27F9"],
+                     @"Longleftrightarrow" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u27FA"],
+
+                     // Harpoons and extended arrows (amssymb)
+                     @"rightleftharpoons" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u21CC"],
+                     @"leftrightharpoons" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u21CB"],
+                     @"upharpoonleft" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u21BF"],
+                     @"upharpoonright" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u21BE"],
+                     @"downharpoonleft" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u21C3"],
+                     @"downharpoonright" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u21C2"],
+                     @"rightharpoonup" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u21C0"],
+                     @"leftharpoonup" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u21BC"],
+                     @"rightharpoondown" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u21C1"],
+                     @"leftharpoondown" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u21BD"],
+                     @"hookleftarrow" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u21A9"],
+                     @"hookrightarrow" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u21AA"],
+                     @"twoheadleftarrow" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u219E"],
+                     @"twoheadrightarrow" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u21A0"],
+                     @"rightarrowtail" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u21A3"],
+                     @"leftarrowtail" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u21A2"],
+
+
+                     // Relations
+                     @"leq" : [MTMathAtom atomWithType:kMTMathAtomRelation value:MTSymbolLessEqual],
+                     @"geq" : [MTMathAtom atomWithType:kMTMathAtomRelation value:MTSymbolGreaterEqual],
+                     @"neq" : [MTMathAtom atomWithType:kMTMathAtomRelation value:MTSymbolNotEqual],
+                     @"in" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2208"],
+                     @"notin" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2209"],
+                     @"ni" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u220B"],
+                     @"propto" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u221D"],
+                     @"mid" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2223"],
+                     @"parallel" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2225"],
+                     @"sim" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u223C"],
+                     @"simeq" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2243"],
+                     @"cong" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2245"],
+                     @"approx" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2248"],
+                     @"asymp" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u224D"],
+                     @"doteq" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2250"],
+                     @"equiv" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2261"],
+                     @"gg" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u226B"],
+                     @"ll" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u226A"],
+                     @"prec" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u227A"],
+                     @"succ" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u227B"],
+                     @"preceq" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2AAF"],
+                     @"succeq" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2AB0"],
+                     @"preccurlyeq" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u227C"],
+                     @"succcurlyeq" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u227D"],
+                     @"curlyeqprec" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u22DE"],
+                     @"curlyeqsucc" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u22DF"],
+                     @"precsim" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u227E"],
+                     @"succsim" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u227F"],
+                     @"precapprox" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2AB7"],
+                     @"succapprox" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2AB8"],
+                     @"subset" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2282"],
+                     @"supset" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2283"],
+                     @"subseteq" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2286"],
+                     @"supseteq" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2287"],
+                     @"sqsubset" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u228F"],
+                     @"sqsupset" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2290"],
+                     @"sqsubseteq" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2291"],
+                     @"sqsupseteq" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2292"],
+                     @"models" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u22A7"],
+                     @"perp" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u27C2"],
+
+                     // Negated relations (amssymb)
+                     @"nleq" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2270"],
+                     @"ngeq" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2271"],
+                     @"nless" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u226E"],
+                     @"ngtr" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u226F"],
+                     @"nsubseteq" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2288"],
+                     @"nsupseteq" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2289"],
+                     @"nmid" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2224"],
+                     @"nparallel" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2226"],
+                     @"nleftarrow" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u219A"],
+                     @"nrightarrow" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u219B"],
+                     @"nLeftarrow" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u21CD"],
+                     @"nRightarrow" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u21CF"],
+                     @"nleftrightarrow" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u21AE"],
+                     @"nLeftrightarrow" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u21CE"],
+                     @"nvdash" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u22AC"],
+                     @"nvDash" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u22AD"],
+                     @"nVdash" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u22AE"],
+                     @"nVDash" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u22AF"],
+                     @"ntriangleleft" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u22EA"],
+                     @"ntriangleright" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u22EB"],
+                     @"ntrianglelefteq" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u22EC"],
+                     @"ntrianglerighteq" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u22ED"],
+                     @"nsim" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2241"],
+                     @"ncong" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2247"],
+                     @"nequiv" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2262"],
+                     @"nsubset" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2284"],
+                     @"nsupset" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2285"],
+                     @"nsucc" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2281"],
+                     @"nprec" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2280"],
+                     @"nsucceq" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u22E1"],
+                     @"npreceq" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u22E0"],
+                     @"nprecsim" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u22E8"],
+                     @"nsuccsim" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u22E9"],
+                     @"nprecapprox" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2AB9"],
+                     @"nsuccapprox" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2ABA"],
+                     @"precneq" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2AB1"],
+                     @"succneq" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2AB2"],
+                     @"precneqq" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2AB5"],
+                     @"succneqq" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2AB6"],
+                     @"precnsim" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u22E6"],
+                     @"succnsim" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u22E7"],
+
+                     // Missing relations (proof / set theory / amssymb)
+                     @"vdash" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u22A2"],
+                     @"dashv" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u22A3"],
+                     @"Subset" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u22D0"],
+                     @"Supset" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u22D1"],
+                     @"backsim" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u223D"],
+                     @"backsimeq" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u22CD"],
+                     @"eqsim" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2242"],
+                     @"Bumpeq" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u224E"],
+                     @"bumpeq" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u224F"],
+                     @"therefore" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2234"],
+                     @"because" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2235"],
+                     @"multimap" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u22B8"],
+                     @"vartriangleleft" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u22B2"],
+                     @"vartriangleright" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u22B3"],
+                     @"trianglelefteq" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u22B4"],
+                     @"trianglerighteq" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u22B5"],
+                     @"triangleq" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u225C"],
+                     // '<' / '>' are literal characters, not commands, so these cannot go
+                     // through the aliases map (command -> command). Map them straight to the
+                     // relation atoms produced by the literal characters.
+                     @"lt" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"<"],
+                     @"gt" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@">"],
+                     @"frown" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2322"],
+                     @"smile" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u2323"],
+                     @"bowtie" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u22C8"],
+                     @"longmapsto" : [MTMathAtom atomWithType:kMTMathAtomRelation value:@"\u27FC"],
+
+                     // Missing ordinaries (logic / suits / Hebrew letters / amssymb)
+                     @"complement" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\u2201"],
+                     @"Box" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\u25A1"],
+                     @"Diamond" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\u25C7"],
+                     @"lozenge" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\u25CA"],
+                     @"blacklozenge" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\u29EB"],
+                     @"diamondsuit" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\u2662"],
+                     @"heartsuit" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\u2661"],
+                     @"spadesuit" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\u2660"],
+                     @"clubsuit" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\u2663"],
+                     @"beth" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\u2136"],
+                     @"gimel" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\u2137"],
+                     @"daleth" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\u2138"],
+                     @"triangledown" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\u25BD"],
+                     @"blacktriangle" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\u25B2"],
+                     @"blacktriangledown" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\u25BC"],
+                     @"blacktriangleleft" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\u25C0"],
+                     @"blacktriangleright" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\u25B6"],
+
+                     // operators
+                     @"times" : [MTMathAtomFactory times],
+                     @"div"   : [MTMathAtomFactory divide],
+                     @"pm"    : [MTMathAtom atomWithType:kMTMathAtomBinaryOperator value:@"\u00B1"],
+                     @"dagger" : [MTMathAtom atomWithType:kMTMathAtomBinaryOperator value:@"\u2020"],
+                     @"ddagger" : [MTMathAtom atomWithType:kMTMathAtomBinaryOperator value:@"\u2021"],
+                     @"mp"    : [MTMathAtom atomWithType:kMTMathAtomBinaryOperator value:@"\u2213"],
+                     @"setminus" : [MTMathAtom atomWithType:kMTMathAtomBinaryOperator value:@"\u2216"],
+                     @"ast"   : [MTMathAtom atomWithType:kMTMathAtomBinaryOperator value:@"\u2217"],
+                     @"circ"  : [MTMathAtom atomWithType:kMTMathAtomBinaryOperator value:@"\u2218"],
+                     @"bullet" : [MTMathAtom atomWithType:kMTMathAtomBinaryOperator value:@"\u2219"],
+                     @"wedge" : [MTMathAtom atomWithType:kMTMathAtomBinaryOperator value:@"\u2227"],
+                     @"vee" : [MTMathAtom atomWithType:kMTMathAtomBinaryOperator value:@"\u2228"],
+                     @"cap" : [MTMathAtom atomWithType:kMTMathAtomBinaryOperator value:@"\u2229"],
+                     @"cup" : [MTMathAtom atomWithType:kMTMathAtomBinaryOperator value:@"\u222A"],
+                     // \bmod: LaTeX kernel's binary "mod". The nucleus is plain ASCII
+                     // "mod", which renders upright because changeFont's italic remap
+                     // only touches Variable/Number atoms (MTTypesetter.m:539-545).
+                     // iosMath's automatic Bin spacing (4mu text/display, 0 in scripts)
+                     // stands in for amsmath's hand-tuned 5mu -- LLD section 4.3.
+                     @"bmod" : [MTMathAtom atomWithType:kMTMathAtomBinaryOperator value:@"mod"],
+                     @"wr" : [MTMathAtom atomWithType:kMTMathAtomBinaryOperator value:@"\u2240"],
+                     @"uplus" : [MTMathAtom atomWithType:kMTMathAtomBinaryOperator value:@"\u228E"],
+                     @"sqcap" : [MTMathAtom atomWithType:kMTMathAtomBinaryOperator value:@"\u2293"],
+                     @"sqcup" : [MTMathAtom atomWithType:kMTMathAtomBinaryOperator value:@"\u2294"],
+                     @"oplus" : [MTMathAtom atomWithType:kMTMathAtomBinaryOperator value:@"\u2295"],
+                     @"ominus" : [MTMathAtom atomWithType:kMTMathAtomBinaryOperator value:@"\u2296"],
+                     @"otimes" : [MTMathAtom atomWithType:kMTMathAtomBinaryOperator value:@"\u2297"],
+                     @"oslash" : [MTMathAtom atomWithType:kMTMathAtomBinaryOperator value:@"\u2298"],
+                     @"odot" : [MTMathAtom atomWithType:kMTMathAtomBinaryOperator value:@"\u2299"],
+                     @"star"  : [MTMathAtom atomWithType:kMTMathAtomBinaryOperator value:@"\u22C6"],
+                     @"cdot"  : [MTMathAtom atomWithType:kMTMathAtomBinaryOperator value:@"\u22C5"],
+                     @"amalg" : [MTMathAtom atomWithType:kMTMathAtomBinaryOperator value:@"\u2A3F"],
+
+                     // Boxed / circled binary operators (amssymb)
+                     @"boxplus" : [MTMathAtom atomWithType:kMTMathAtomBinaryOperator value:@"\u229E"],
+                     @"boxminus" : [MTMathAtom atomWithType:kMTMathAtomBinaryOperator value:@"\u229F"],
+                     @"boxtimes" : [MTMathAtom atomWithType:kMTMathAtomBinaryOperator value:@"\u22A0"],
+                     @"boxdot" : [MTMathAtom atomWithType:kMTMathAtomBinaryOperator value:@"\u22A1"],
+                     @"circledast" : [MTMathAtom atomWithType:kMTMathAtomBinaryOperator value:@"\u229B"],
+                     @"circledcirc" : [MTMathAtom atomWithType:kMTMathAtomBinaryOperator value:@"\u229A"],
+                     @"circleddash" : [MTMathAtom atomWithType:kMTMathAtomBinaryOperator value:@"\u229D"],
+                     @"barwedge" : [MTMathAtom atomWithType:kMTMathAtomBinaryOperator value:@"\u22BC"],
+                     @"veebar" : [MTMathAtom atomWithType:kMTMathAtomBinaryOperator value:@"\u22BB"],
+                     @"triangleleft" : [MTMathAtom atomWithType:kMTMathAtomBinaryOperator value:@"\u25C1"],
+                     @"triangleright" : [MTMathAtom atomWithType:kMTMathAtomBinaryOperator value:@"\u25B7"],
+                     @"diamond" : [MTMathAtom atomWithType:kMTMathAtomBinaryOperator value:@"\u22C4"],
+                     @"bigcirc" : [MTMathAtom atomWithType:kMTMathAtomBinaryOperator value:@"\u25EF"],
+                     // \bigtriangleup / \bigtriangledown share glyphs with the ordinary
+                     // \triangle (U+25B3) / \triangledown (U+25BD) but must have binary-op spacing.
+                     @"bigtriangleup" : [MTMathAtom atomWithType:kMTMathAtomBinaryOperator value:@"\u25B3"],
+                     @"bigtriangledown" : [MTMathAtom atomWithType:kMTMathAtomBinaryOperator value:@"\u25BD"],
+
+                     // No limit operators
+                     @"log" : [MTMathAtomFactory operatorWithName:@"log" limits:NO],
+                     @"lg" : [MTMathAtomFactory operatorWithName:@"lg" limits:NO],
+                     @"ln" : [MTMathAtomFactory operatorWithName:@"ln" limits:NO],
+                     @"sin" : [MTMathAtomFactory operatorWithName:@"sin" limits:NO],
+                     @"arcsin" : [MTMathAtomFactory operatorWithName:@"arcsin" limits:NO],
+                     @"sinh" : [MTMathAtomFactory operatorWithName:@"sinh" limits:NO],
+                     @"cos" : [MTMathAtomFactory operatorWithName:@"cos" limits:NO],
+                     @"arccos" : [MTMathAtomFactory operatorWithName:@"arccos" limits:NO],
+                     @"cosh" : [MTMathAtomFactory operatorWithName:@"cosh" limits:NO],
+                     @"tan" : [MTMathAtomFactory operatorWithName:@"tan" limits:NO],
+                     @"arctan" : [MTMathAtomFactory operatorWithName:@"arctan" limits:NO],
+                     @"tanh" : [MTMathAtomFactory operatorWithName:@"tanh" limits:NO],
+                     @"cot" : [MTMathAtomFactory operatorWithName:@"cot" limits:NO],
+                     @"coth" : [MTMathAtomFactory operatorWithName:@"coth" limits:NO],
+                     @"sec" : [MTMathAtomFactory operatorWithName:@"sec" limits:NO],
+                     @"csc" : [MTMathAtomFactory operatorWithName:@"csc" limits:NO],
+                     @"arg" : [MTMathAtomFactory operatorWithName:@"arg" limits:NO],
+                     @"ker" : [MTMathAtomFactory operatorWithName:@"ker" limits:NO],
+                     @"dim" : [MTMathAtomFactory operatorWithName:@"dim" limits:NO],
+                     @"hom" : [MTMathAtomFactory operatorWithName:@"hom" limits:NO],
+                     @"exp" : [MTMathAtomFactory operatorWithName:@"exp" limits:NO],
+                     @"deg" : [MTMathAtomFactory operatorWithName:@"deg" limits:NO],
+                     
+                     // Limit operators
+                     @"lim" : [MTMathAtomFactory operatorWithName:@"lim" limits:YES],
+                     @"limsup" : [MTMathAtomFactory operatorWithName:@"lim sup" limits:YES],
+                     @"liminf" : [MTMathAtomFactory operatorWithName:@"lim inf" limits:YES],
+                     @"max" : [MTMathAtomFactory operatorWithName:@"max" limits:YES],
+                     @"min" : [MTMathAtomFactory operatorWithName:@"min" limits:YES],
+                     @"sup" : [MTMathAtomFactory operatorWithName:@"sup" limits:YES],
+                     @"inf" : [MTMathAtomFactory operatorWithName:@"inf" limits:YES],
+                     @"det" : [MTMathAtomFactory operatorWithName:@"det" limits:YES],
+                     @"Pr" : [MTMathAtomFactory operatorWithName:@"Pr" limits:YES],
+                     @"gcd" : [MTMathAtomFactory operatorWithName:@"gcd" limits:YES],
+                     
+                     // Large operators
+                     @"prod" : [MTMathAtomFactory operatorWithName:@"\u220F" limits:YES],
+                     @"coprod" : [MTMathAtomFactory operatorWithName:@"\u2210" limits:YES],
+                     @"sum" : [MTMathAtomFactory operatorWithName:@"\u2211" limits:YES],
+                     @"int" : [MTMathAtomFactory operatorWithName:@"\u222B" limits:NO],
+                     @"oint" : [MTMathAtomFactory operatorWithName:@"\u222E" limits:NO],
+                     // AMS multi-integrals
+                     @"iint" : [MTMathAtomFactory operatorWithName:@"\u222C" limits:NO],
+                     @"iiint" : [MTMathAtomFactory operatorWithName:@"\u222D" limits:NO],
+                     @"iiiint" : [MTMathAtomFactory operatorWithName:@"\u2A0C" limits:NO],
+                     @"oiint" : [MTMathAtomFactory operatorWithName:@"\u222F" limits:NO],
+                     @"oiiint" : [MTMathAtomFactory operatorWithName:@"\u2230" limits:NO],
+                     @"varointclockwise" : [MTMathAtomFactory operatorWithName:@"\u2232" limits:NO],
+                     @"ointctrclockwise" : [MTMathAtomFactory operatorWithName:@"\u2233" limits:NO],
+                     @"bigwedge" : [MTMathAtomFactory operatorWithName:@"\u22C0" limits:YES],
+                     @"bigvee" : [MTMathAtomFactory operatorWithName:@"\u22C1" limits:YES],
+                     @"bigcap" : [MTMathAtomFactory operatorWithName:@"\u22C2" limits:YES],
+                     @"bigcup" : [MTMathAtomFactory operatorWithName:@"\u22C3" limits:YES],
+                     @"bigodot" : [MTMathAtomFactory operatorWithName:@"\u2A00" limits:YES],
+                     @"bigoplus" : [MTMathAtomFactory operatorWithName:@"\u2A01" limits:YES],
+                     @"bigotimes" : [MTMathAtomFactory operatorWithName:@"\u2A02" limits:YES],
+                     @"biguplus" : [MTMathAtomFactory operatorWithName:@"\u2A04" limits:YES],
+                     @"bigsqcup" : [MTMathAtomFactory operatorWithName:@"\u2A06" limits:YES],
+                     
+                     // Latex command characters
+                     @"{" : [MTMathAtom atomWithType:kMTMathAtomOpen value:@"{"],
+                     @"}" : [MTMathAtom atomWithType:kMTMathAtomClose value:@"}"],
+                     @"$" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"$"],
+                     @"&" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"&"],
+                     @"#" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"#"],
+                     @"%" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"%"],
+                     @"_" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"_"],
+                     @" " : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@" "],
+                     @"backslash" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\\"],
+                     
+                     // Punctuation
+                     // Note: \colon is different from : which is a relation
+                     @"colon" : [MTMathAtom atomWithType:kMTMathAtomPunctuation value:@":"],
+                     @"cdotp" : [MTMathAtom atomWithType:kMTMathAtomPunctuation value:@"\u00B7"],
+                     
+                     // Other symbols
+                     @"degree" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\u00B0"],
+                     @"neg" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\u00AC"],
+                     @"angstrom" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\u00C5"],
+                     @"|" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\u2016"],
+                     @"vert" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"|"],
+                     @"ldots" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\u2026"],
+                     @"prime" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\u2032"],
+                     @"hbar" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\u210F"],
+                     @"Im" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\u2111"],
+                     @"ell" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\u2113"],
+                     @"wp" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\u2118"],
+                     @"Re" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\u211C"],
+                     @"mho" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\u2127"],
+                     @"aleph" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\u2135"],
+                     @"forall" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\u2200"],
+                     @"exists" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\u2203"],
+                     @"emptyset" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\u2205"],
+                     @"nabla" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\u2207"],
+                     @"infty" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\u221E"],
+                     @"angle" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\u2220"],
+                     @"top" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\u22A4"],
+                     @"bot" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\u22A5"],
+                     @"vdots" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\u22EE"],
+                     @"cdots" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\u22EF"],
+                     @"ddots" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\u22F1"],
+                     @"triangle" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\u25B3"],
+                     @"surd" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\u221A"],
+                     @"flat" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\u266D"],
+                     @"natural" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\u266E"],
+                     @"sharp" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\u266F"],
+                     @"imath" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\U0001D6A4"],
+                     @"jmath" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\U0001D6A5"],
+                     @"partial" : [MTMathAtom atomWithType:kMTMathAtomOrdinary value:@"\U0001D715"],
+                     
+                     // Spacing
+                     @"," : [[MTMathSpace alloc] initWithSpace:3],
+                     @">" : [[MTMathSpace alloc] initWithSpace:4],
+                     @";" : [[MTMathSpace alloc] initWithSpace:5],
+                     @"!" : [[MTMathSpace alloc] initWithSpace:-3],
+                     @"quad" : [[MTMathSpace alloc] initWithSpace:18],  // quad = 1em = 18mu
+                     @"qquad" : [[MTMathSpace alloc] initWithSpace:36], // qquad = 2em
+                     // amsmath's named forms. The stretch components (\medspace is
+                     // 4mu plus 2mu minus 4mu) are dropped — nothing here stretches.
+                     @"thinspace" : [[MTMathSpace alloc] initWithSpace:3],
+                     @"medspace" : [[MTMathSpace alloc] initWithSpace:4],
+                     @"thickspace" : [[MTMathSpace alloc] initWithSpace:5],
+                     @"negthinspace" : [[MTMathSpace alloc] initWithSpace:-3],
+                     @"negmedspace" : [[MTMathSpace alloc] initWithSpace:-4],
+                     @"negthickspace" : [[MTMathSpace alloc] initWithSpace:-5],
+                     
+                     // Style
+                     @"displaystyle" : [[MTMathStyle alloc] initWithStyle:kMTLineStyleDisplay],
+                     @"textstyle" : [[MTMathStyle alloc] initWithStyle:kMTLineStyleText],
+                     @"scriptstyle" : [[MTMathStyle alloc] initWithStyle:kMTLineStyleScript],
+                     @"scriptscriptstyle" : [[MTMathStyle alloc] initWithStyle:kMTLineStyleScriptScript],
+                     }];
+    });
+    return commands;
+}
+
+// Each entry is amsmath's exact inline expansion as a #N template. Not reproduced
+// is amsmath's \if@display switch to an 18mu leading gap, because a macro expands
+// at parse time, before the render style is known.
+//
+// This dispatch_once builds strings only. Parsing one here would re-enter
+// -macroAtomForCommand: (every command reaches it) and deadlock, so templates are
+// parsed per invocation instead.
++ (NSMutableDictionary<NSString*, MTMacroDefinition*>*) macros
+{
+    static NSMutableDictionary<NSString*, MTMacroDefinition*>* macros = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        macros = [NSMutableDictionary dictionaryWithDictionary:@{
+            @"pmod": [[MTMacroDefinition alloc] initWithArgumentCount:1
+                      templateString:@"\\mkern8mu(\\mathrm{mod}\\mkern6mu#1)"],
+            @"mod":  [[MTMacroDefinition alloc] initWithArgumentCount:1
+                      templateString:@"\\mkern12mu\\mathrm{mod}\\mkern6mu#1"],
+            @"pod":  [[MTMacroDefinition alloc] initWithArgumentCount:1
+                      templateString:@"\\mkern8mu(#1)"],
+
+            // amsmath pads all three with \; on both sides. They were aliases of
+            // the bare arrow until now, which renders tighter than amsmath.
+            @"implies":   [[MTMacroDefinition alloc] initWithArgumentCount:0
+                           templateString:@"\\;\\Longrightarrow\\;"],
+            @"impliedby": [[MTMacroDefinition alloc] initWithArgumentCount:0
+                           templateString:@"\\;\\Longleftarrow\\;"],
+            @"iff":       [[MTMacroDefinition alloc] initWithArgumentCount:0
+                           templateString:@"\\;\\Longleftrightarrow\\;"],
+
+            @"idotsint":  [[MTMacroDefinition alloc] initWithArgumentCount:0
+                           templateString:@"\\int\\cdots\\int"],
+
+            // amsmath builds these four out of \mathop, which iosMath has no
+            // command for. Without it the expansion is an Ord rather than an Op,
+            // which costs two things: a script lands to the right instead of
+            // centred underneath, and the 3mu an Op gets against the atom after
+            // it is missing. The symbol is right, the spacing around it is not.
+            // Known limitation; revisit if \mathop is ever added.
+            @"varliminf":  [[MTMacroDefinition alloc] initWithArgumentCount:0
+                            templateString:@"\\underline{\\lim}"],
+            @"varlimsup":  [[MTMacroDefinition alloc] initWithArgumentCount:0
+                            templateString:@"\\overline{\\lim}"],
+            @"varinjlim":  [[MTMacroDefinition alloc] initWithArgumentCount:0
+                            templateString:@"\\underrightarrow{\\lim}"],
+            @"varprojlim": [[MTMacroDefinition alloc] initWithArgumentCount:0
+                            templateString:@"\\underleftarrow{\\lim}"],
+        }];
+    });
+    return macros;
+}
+
++ (BOOL) template:(NSString*) templateString referencesOnlyArgumentsUpTo:(NSUInteger) argumentCount
+{
+    for (NSUInteger i = 0; i + 1 < templateString.length; i++) {
+        if ([templateString characterAtIndex:i] != '#') {
+            continue;
+        }
+        unichar digit = [templateString characterAtIndex:i + 1];
+        if (digit < '1' || digit > '9' || (NSUInteger)(digit - '0') > argumentCount) {
+            return NO;
+        }
+        i++;
+    }
+    return YES;
+}
+
++ (void) addMacro:(NSString*) name
+    argumentCount:(NSUInteger) argumentCount
+         template:(NSString*) templateString
+{
+    NSParameterAssert(name);
+    NSParameterAssert(templateString);
+    NSAssert(argumentCount <= 9, @"\\%@ declares %lu arguments; a macro can take at most 9",
+             name, (unsigned long)argumentCount);
+    NSAssert([self template:templateString referencesOnlyArgumentsUpTo:argumentCount],
+             @"Template for \\%@ references an argument beyond its %lu declared argument(s): %@",
+             name, (unsigned long)argumentCount, templateString);
+    // Same setup-time contract as +addLatexSymbol:value: — the table is read
+    // unguarded once initialized. Do not call this while parsing on another thread.
+    [self macros][name] = [[MTMacroDefinition alloc] initWithArgumentCount:argumentCount
+                                                           templateString:templateString];
+}
+
++ (nullable MTMacroDefinition*) macroDefinitionForCommand:(NSString*) command
+{
+    return [self macros][command];
+}
+
++ (NSDictionary*) aliases
+{
+    static NSDictionary* aliases = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        aliases = @{
+                    @"lnot" : @"neg",
+                    @"land" : @"wedge",
+                    @"lor" : @"vee",
+                    @"ne" : @"neq",
+                    @"le" : @"leq",
+                    @"ge" : @"geq",
+                    @"lbrace" : @"{",
+                    @"rbrace" : @"}",
+                    @"Vert" : @"|",
+                    @"gets" : @"leftarrow",
+                    @"to" : @"rightarrow",
+                    @"AA" : @"angstrom",
+                    @"restriction" : @"upharpoonright",
+                    // \iff, \implies and \impliedby moved to +macros: amsmath
+                    // pads them with \;, which one symbol atom cannot express.
+                    @"dotsc" : @"ldots",
+                    @"dotsb" : @"cdots",
+                    @"dotsm" : @"cdots",
+                    @"dotsi" : @"ldots",
+                    @"square" : @"Box",
+                    @"vartriangle" : @"triangle",
+                    @"nsucccurlyeq" : @"nsucceq",
+                    @"npreccurlyeq" : @"npreceq",
+                    @"precnapprox" : @"nprecapprox",
+                    @"succnapprox" : @"nsuccapprox",
+                    };
+    });
+    return aliases;
+}
+
++ (NSMutableDictionary<NSString*, NSMutableDictionary<NSNumber*, NSString*>*>*) textToLatexSymbolNames
+{
+    static NSMutableDictionary<NSString*, NSMutableDictionary<NSNumber*, NSString*>*>* textToCommands = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSDictionary* commands = [self supportedLatexSymbols];
+        textToCommands = [NSMutableDictionary dictionaryWithCapacity:commands.count];
+        for (NSString* command in commands) {
+            MTMathAtom* atom = commands[command];
+            if (atom.nucleus.length == 0) {
+                continue;
+            }
+            NSNumber* typeKey = @(atom.type);
+
+            NSMutableDictionary<NSNumber*, NSString*>* inner = textToCommands[atom.nucleus];
+            if (!inner) {
+                inner = [NSMutableDictionary dictionaryWithCapacity:1];
+                textToCommands[atom.nucleus] = inner;
+            }
+
+            NSString* existingCommand = inner[typeKey];
+            if (existingCommand) {
+                // If there are 2 commands for the same (nucleus, type), choose
+                // one deterministically: shorter wins, alphabetical ascending breaks ties.
+                if (command.length > existingCommand.length) {
+                    continue;
+                } else if (command.length == existingCommand.length) {
+                    if ([command compare:existingCommand] == NSOrderedDescending) {
+                        continue;
+                    }
+                }
+            }
+            inner[typeKey] = command;
+        }
+    });
+    return textToCommands;
+}
+
++ (NSDictionary<NSString*, NSString*>*) accents
+{
+    static NSDictionary* accents = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        accents = @{
+                    @"grave" : @"\u0300",
+                    @"acute" : @"\u0301",
+                    @"hat" : @"\u0302",  // In our implementation hat and widehat behave the same.
+                    @"tilde" : @"\u0303", // In our implementation tilde and widetilde behave the same.
+                    @"bar" : @"\u0304",
+                    @"breve" : @"\u0306",
+                    @"dot" : @"\u0307",
+                    @"ddot" : @"\u0308",
+                    @"check" : @"\u030C",
+                    @"vec" : @"\u20D7",
+                    @"widehat" : @"\u0302",
+                    @"widetilde" : @"\u0303",
+                    };
+    });
+    return accents;
+}
+
++ (NSDictionary*) accentValueToName
+{
+    static NSDictionary* accentToCommands = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSDictionary* accents = [self accents];
+        NSMutableDictionary* mutableDict = [NSMutableDictionary dictionaryWithCapacity:accents.count];
+        for (NSString* command in accents) {
+            NSString* acc = accents[command];
+            NSString* existingCommand = mutableDict[acc];
+            if (existingCommand) {
+                if (command.length > existingCommand.length) {
+                    // Keep the shorter command
+                    continue;
+                } else if (command.length == existingCommand.length) {
+                    // If the length is the same, keep the alphabetically first
+                    if ([command compare:existingCommand] == NSOrderedDescending) {
+                        continue;
+                    }
+                }
+            }
+            // In other cases replace the command.
+            mutableDict[acc] = command;
+        }
+        accentToCommands = [mutableDict copy];
+    });
+    return accentToCommands;
+}
+
++(NSDictionary<NSString*, NSString*> *) delimiters
+{
+    static NSDictionary* delims = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        delims = @{
+                   @"." : @"", // . means no delimiter
+                   @"(" : @"(",
+                   @")" : @")",
+                   @"[" : @"[",
+                   @"]" : @"]",
+                   @"<" : @"\u27E8",
+                   @">" : @"\u27E9",
+                   @"/" : @"/",
+                   @"\\" : @"\\",
+                   @"|" : @"|",
+                   @"lgroup" : @"\u27EE",
+                   @"rgroup" : @"\u27EF",
+                   @"||" : @"\u2016",
+                   @"Vert" : @"\u2016",
+                   @"vert" : @"|",
+                   @"uparrow" : @"\u2191",
+                   @"downarrow" : @"\u2193",
+                   @"updownarrow" : @"\u2195",
+                   @"Uparrow" : @"\u21D1",
+                   @"Downarrow" : @"\u21D3",
+                   @"Updownarrow" : @"\u21D5",
+                   @"backslash" : @"\\",
+                   @"rangle" : @"\u27E9",
+                   @"langle" : @"\u27E8",
+                   @"rbrace" : @"}",
+                   @"}" : @"}",
+                   @"{" : @"{",
+                   @"lbrace" : @"{",
+                   @"lceil" : @"\u2308",
+                   @"rceil" : @"\u2309",
+                   @"lfloor" : @"\u230A",
+                   @"rfloor" : @"\u230B",
+                   };
+    });
+    return delims;
+}
+
++ (NSDictionary*) delimValueToName
+{
+    static NSDictionary* delimToCommands = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSDictionary* delims = [self delimiters];
+        NSMutableDictionary* mutableDict = [NSMutableDictionary dictionaryWithCapacity:delims.count];
+        for (NSString* command in delims) {
+            NSString* delim = delims[command];
+            NSString* existingCommand = mutableDict[delim];
+            if (existingCommand) {
+                if (command.length > existingCommand.length) {
+                    // Keep the shorter command
+                    continue;
+                } else if (command.length == existingCommand.length) {
+                    // If the length is the same, keep the alphabetically first
+                    if ([command compare:existingCommand] == NSOrderedDescending) {
+                        continue;
+                    }
+                }
+            }
+            // In other cases replace the command.
+            mutableDict[delim] = command;
+        }
+        delimToCommands = [mutableDict copy];
+    });
+    return delimToCommands;
+}
+
+
++(NSDictionary<NSString*, NSNumber*> *) fontStyles
+{
+    static NSDictionary<NSString*, NSNumber*>* fontStyles = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        // \text* commands are handled by the parser via the textStyles
+        // dictionary, so they do NOT appear here.
+        fontStyles = @{
+                       @"mathnormal" : @(kMTFontStyleDefault),
+                       @"mathrm": @(kMTFontStyleRoman),
+                       @"rm": @(kMTFontStyleRoman),
+                       @"mathbf": @(kMTFontStyleBold),
+                       @"bf": @(kMTFontStyleBold),
+                       @"mathcal": @(kMTFontStyleCaligraphic),
+                       @"cal": @(kMTFontStyleCaligraphic),
+                       @"mathtt": @(kMTFontStyleTypewriter),
+                       @"mathit": @(kMTFontStyleItalic),
+                       @"mit": @(kMTFontStyleItalic),
+                       @"mathsf": @(kMTFontStyleSansSerif),
+                       @"mathfrak": @(kMTFontStyleFraktur),
+                       @"frak": @(kMTFontStyleFraktur),
+                       @"mathbb": @(kMTFontStyleBlackboard),
+                       @"mathbfit": @(kMTFontStyleBoldItalic),
+                       @"bm": @(kMTFontStyleBoldItalic),
+                   };
+    });
+    return fontStyles;
+}
+
+#pragma mark - Stack commands
+
++ (NSDictionary<NSString*, MTMathStackCommandSpec*>*) stackCommands
+{
+    static NSDictionary* stackCommands = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        // Each command maps to a single stretchy cap glyph (a Unicode codepoint). The
+        // typesetter walks the cap's OpenType h_variants first; if no variant is wide
+        // enough, it falls back to the font's HorizontalGlyphAssembly (parts + connector
+        // overlaps). The cap codepoint must therefore be one whose OpenType MATH table
+        // provides assembly data — the arrow caps carry their own .lft/.ex/.rt parts.
+        MTMathStackConstruction* rightArrow     = [MTMathStackConstruction extensibleWithGlyph:@"\u2192"];
+        MTMathStackConstruction* leftArrow      = [MTMathStackConstruction extensibleWithGlyph:@"\u2190"];
+        MTMathStackConstruction* leftRightArrow = [MTMathStackConstruction extensibleWithGlyph:@"\u2194"];
+        MTMathStackConstruction* overBrace      = [MTMathStackConstruction extensibleWithGlyph:@"\u23DE"];
+        MTMathStackConstruction* underBrace     = [MTMathStackConstruction extensibleWithGlyph:@"\u23DF"];
+
+        NSArray* baseOnly = @[@(kMTStackArgBase)];
+        stackCommands = @{
+            @"overrightarrow":     [[MTMathStackCommandSpec alloc] initWithOver:rightArrow     under:nil            displayClass:kMTMathAtomOrdinary argRoles:baseOnly inheritsClass:NO],
+            @"overleftarrow":      [[MTMathStackCommandSpec alloc] initWithOver:leftArrow      under:nil            displayClass:kMTMathAtomOrdinary argRoles:baseOnly inheritsClass:NO],
+            @"overleftrightarrow": [[MTMathStackCommandSpec alloc] initWithOver:leftRightArrow under:nil            displayClass:kMTMathAtomOrdinary argRoles:baseOnly inheritsClass:NO],
+            @"underrightarrow":    [[MTMathStackCommandSpec alloc] initWithOver:nil            under:rightArrow     displayClass:kMTMathAtomOrdinary argRoles:baseOnly inheritsClass:NO],
+            @"underleftarrow":     [[MTMathStackCommandSpec alloc] initWithOver:nil            under:leftArrow      displayClass:kMTMathAtomOrdinary argRoles:baseOnly inheritsClass:NO],
+            @"underleftrightarrow":[[MTMathStackCommandSpec alloc] initWithOver:nil            under:leftRightArrow displayClass:kMTMathAtomOrdinary argRoles:baseOnly inheritsClass:NO],
+            @"overbrace":          [[MTMathStackCommandSpec alloc] initWithOver:overBrace      under:nil            displayClass:kMTMathAtomOrdinary argRoles:baseOnly inheritsClass:NO],
+            @"underbrace":         [[MTMathStackCommandSpec alloc] initWithOver:nil            under:underBrace     displayClass:kMTMathAtomOrdinary argRoles:baseOnly inheritsClass:NO],
+            @"overset":            [[MTMathStackCommandSpec alloc] initWithOver:nil under:nil displayClass:kMTMathAtomOrdinary       argRoles:@[@(kMTStackArgOver),  @(kMTStackArgBase)] inheritsClass:YES],
+            @"underset":           [[MTMathStackCommandSpec alloc] initWithOver:nil under:nil displayClass:kMTMathAtomOrdinary       argRoles:@[@(kMTStackArgUnder), @(kMTStackArgBase)] inheritsClass:YES],
+            @"stackrel":           [[MTMathStackCommandSpec alloc] initWithOver:nil under:nil displayClass:kMTMathAtomRelation       argRoles:@[@(kMTStackArgOver),  @(kMTStackArgBase)] inheritsClass:NO],
+            @"stackbin":           [[MTMathStackCommandSpec alloc] initWithOver:nil under:nil displayClass:kMTMathAtomBinaryOperator argRoles:@[@(kMTStackArgOver),  @(kMTStackArgBase)] inheritsClass:NO],
+        };
+    });
+    return stackCommands;
+}
+
++ (nullable MTMathStack*) stackAtomForCommand:(NSString*)command
+{
+    MTMathStackCommandSpec* spec = [self stackCommands][command];
+    if (!spec) {
+        return nil;
+    }
+    MTMathStack* stack = [[MTMathStack alloc] init];
+    stack.over = spec.overConstruction;
+    stack.under = spec.underConstruction;
+    stack.displayClass = spec.displayClass;
+    return stack;
+}
+
++ (nullable MTMathStackCommandSpec*) stackCommandSpec:(NSString*)command
+{
+    return [self stackCommands][command];
+}
+
++ (MTMathAtomType) inheritedDisplayClassForBase:(MTMathList*)base
+{
+    // Option I: inherit a lone Bin/Rel base atom's INTRINSIC class (read before
+    // finalize's Bin->Ord reclassification, matching amsmath \binrel@); else Ordinary.
+    if (base.atoms.count == 1) {
+        MTMathAtomType t = ((MTMathAtom*)base.atoms[0]).type;
+        if (t == kMTMathAtomBinaryOperator || t == kMTMathAtomRelation) {
+            return t;
+        }
+    }
+    return kMTMathAtomOrdinary;
+}
+
+/// Returns a canonical key string encoding the over/under glyphs plus displayClass.
+/// Used as the key for the reverse-lookup dictionary built in stackCommandForStack:.
+static NSString* StackCommandKey(MTMathStackConstruction* _Nullable over,
+                                 MTMathStackConstruction* _Nullable under,
+                                 MTMathAtomType displayClass)
+{
+    NSString* og = over  && over.glyph  ? over.glyph  : @"";
+    NSString* ug = under && under.glyph ? under.glyph : @"";
+    return [NSString stringWithFormat:@"%@|%@|%lu",
+            og, ug, (unsigned long)displayClass];
+}
+
++ (NSDictionary<NSString*, NSString*>*) stackCommandReverseTable
+{
+    static NSDictionary* reverseTable = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSDictionary<NSString*, MTMathStackCommandSpec*>* forward = [self stackCommands];
+        NSMutableDictionary* mutable = [NSMutableDictionary dictionaryWithCapacity:forward.count];
+        for (NSString* cmd in forward) {
+            MTMathStackCommandSpec* spec = forward[cmd];
+            NSString* key = StackCommandKey(spec.overConstruction, spec.underConstruction, spec.displayClass);
+            mutable[key] = cmd;
+        }
+        reverseTable = [mutable copy];
+    });
+    return reverseTable;
+}
+
++ (nullable NSString*) stackCommandForStack:(MTMathStack*)stack
+{
+    BOOL overML  = stack.over  && stack.over.kind  == kMTMathStackConstructionMathList;
+    BOOL underML = stack.under && stack.under.kind == kMTMathStackConstructionMathList;
+    if (overML && underML) {
+        // Composite programmatic stack — no single LaTeX command covers it.
+        return nil;
+    }
+    if (overML || underML) {
+        // Realizes the LLD reverse-map table: under->\underset (any class);
+        // over+Relation->\stackrel; over+Binary->\stackbin; over+else->\overset.
+        if (underML) {
+            return @"underset";
+        }
+        switch (stack.displayClass) {
+            case kMTMathAtomRelation:       return @"stackrel";
+            case kMTMathAtomBinaryOperator: return @"stackbin";
+            default:                        return @"overset";
+        }
+    }
+    // Existing Extensible path (unchanged).
+    if (stack.over && stack.over.kind != kMTMathStackConstructionExtensible) {
+        return nil;
+    }
+    if (stack.under && stack.under.kind != kMTMathStackConstructionExtensible) {
+        return nil;
+    }
+    NSString* key = StackCommandKey(stack.over, stack.under, stack.displayClass);
+    return [self stackCommandReverseTable][key];
+}
+
+@end

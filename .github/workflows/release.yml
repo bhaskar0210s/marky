@@ -1,0 +1,26 @@
+name: release
+
+# Pushing a tag such as v1.0.0 builds Marky and publishes it as a free download.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: make VERSION="${GITHUB_REF_NAME#v}"
+      - name: Package
+        run: ditto -c -k --keepParent build/Marky.app Marky.zip
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" Marky.zip \
+            --title "Marky ${GITHUB_REF_NAME#v}" \
+            --notes "Free and open source. Download Marky.zip, unzip it and move Marky.app to Applications. See the README for first-launch steps."
